@@ -1,0 +1,118 @@
+name: Release 3.x (Windows Only)
+
+on:
+  push:
+    branches:
+      - "develop-3.x"
+    paths:
+      - "bin/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "configs/**"
+      - "core/**"
+      - "entrypoint/**"
+      - "modules/**"
+      - "packaging/**"
+      - "types/**"
+      - "utils/**"
+      - "wwwroot/**"
+      - ".github/workflows/release.yml"
+
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+          - target: i686-pc-windows-msvc
+          - target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: develop-3.x
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ferron3-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ferron3-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Determine version
+        shell: bash
+        run: |
+          VERSION_CARGO="$(grep -E '^version' entrypoint/Cargo.toml | sed -E 's|.*"([0-9A-Za-z.+-]+)".*|\1|')"
+          VERSION_GIT="$(git tag --sort=-committerdate | head -n 1 | sed 's/[^0-9A-Za-z.+-]//g')"
+
+          if [ "$VERSION_CARGO" != "" ]; then
+            echo "FERRON_VERSION=$VERSION_CARGO" >> $GITHUB_ENV
+          elif [ "$VERSION_GIT" != "" ]; then
+            echo "FERRON_VERSION=$VERSION_GIT" >> $GITHUB_ENV
+          else
+            echo "Cannot determine version" >&2
+            exit 1
+          fi
+
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Setup Just
+        uses: extractions/setup-just@v4
+
+      - name: Install bindgen-cli
+        shell: bash
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm bindgen-cli --force
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release --verbose --target ${{ matrix.target }}
+
+      - name: Create Windows installer
+        shell: bash
+        run: |
+          just package-windows ${{ matrix.target }}
+
+      - name: Prepare changelog
+        shell: bash
+        run: |
+          { echo; cat CHANGELOG.md; } \
+            | sed '1,/^## /d;/^## /,$d;/^\*\*Released in/d;' \
+            | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}' \
+            > CHANGES-CURRENT
+
+      - name: Upload artifacts to GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: |
+            dist/ferron-${{ env.FERRON_VERSION }}-${{ matrix.target }}.zip
+            dist/ferron-${{ env.FERRON_VERSION }}-${{ matrix.target }}-setup.exe
+          bodyFile: "CHANGES-CURRENT"
+          tag: "${{ env.FERRON_VERSION }}"
+          commit: "develop-3.x"
